@@ -9,72 +9,57 @@
     const STREAM_URI = "${stream_uri}";
 
     window.onload = () => {
-        let canvasStream = null;
-        let canvas = document.createElement("canvas");
         let process_token = null;
         let stop_update = false;
+        const video = document.getElementById("player-video");
 
-        canvas.width = WIDTH;
-        canvas.height = HEIGHT;
+        function appendTimestamp(url) {
+            const ts = Date.now();
+            return url.includes('?') ? `${url}&ts=${ts}` : `${url}?ts=${ts}`;
+        }
 
-        function setup_interval(){
-            const ctx = canvas.getContext("2d");
-            const img = new Image();
-            let last_timestamp = 0;
+        function startPlayback() {
+            video.src = appendTimestamp(STREAM_URI);
+            const playPromise = video.play();
+            if (playPromise !== undefined) {
+                playPromise.catch(() => {});
+            }
+        }
 
-            img.src = STREAM_URI;
-            img.onload = () => {
-                function render(timestamp) {
-                    if (timestamp - last_timestamp >= 1000.0 / FPS) {
-                        last_timestamp = timestamp;
-                        ctx.drawImage(img, 0, 0);
-                    }
-                    requestAnimationFrame(render);
-                }
-                render();
-            };
-            // check server restart
+        function setup_interval() {
             setInterval(() => {
-	        if (document.hidden) {
-	            return;
-	        }
-	        fetch('/process_token',
-	              {
-                          method: 'GET',
-	              })
-	            .then((res) => {
+                if (stop_update || document.hidden) {
+                    return;
+                }
+                fetch('/process_token', { method: 'GET' })
+                    .then((res) => {
                         if (!res.ok) {
-	                    stop_update = true;
-	                    //console.log("err1", res.status, res.statusText);
+                            stop_update = true;
                         }
                         return res.json();
-	            })
-	            .then((res) => {
-	                //console.log("check token", process_token, res.token);
-	                if (process_token == null) {
-	                    process_token = res.token;
-	                } else if (process_token != res.token) {
-	                    // reload
-	                    process_token = null;
-	                    location.reload();
-	                }
-	            })
-	            .catch((reason) => {
-	                stop_update = true;
-                        //console.log("err2", reason);
-	            });
+                    })
+                    .then((res) => {
+                        if (process_token == null) {
+                            process_token = res.token;
+                        } else if (process_token != res.token) {
+                            process_token = null;
+                            location.reload();
+                        }
+                    })
+                    .catch(() => {
+                        stop_update = true;
+                    });
             }, 4000);
         }
-        
-        function setup_video() {
-            const video = document.getElementById("player-canvas");
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(video, 0, 0, WIDTH, HEIGHT);
-            canvasStream = canvas.captureStream(FPS);  // 0-FPS freq
-            video.srcObject = canvasStream;
-        }
+
+        video.addEventListener('error', () => {
+            if (!stop_update) {
+                setTimeout(startPlayback, 1000);
+            }
+        });
+
+        startPlayback();
         setup_interval();
-        setup_video();
     };
   </script>
   <style type="text/css">
@@ -101,8 +86,8 @@
 </head>
 <body>
   <div class="video-container">
-    <video id="player-canvas" class="video" controls controlsList="nodownload"
-	    autoplay loop muted poster="" disablepictureinpicture >
+    <video id="player-video" class="video" controls controlsList="nodownload"
+            autoplay muted poster="" disablepictureinpicture playsinline>
     </video>
   </div>
 </body>
