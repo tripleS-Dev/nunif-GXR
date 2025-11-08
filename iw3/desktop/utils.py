@@ -276,8 +276,9 @@ def iw3_desktop_main(args, init_wxapp=True):
             frame_height=output_frame_height,
             fps=args.stream_fps,
             index_template=index_template,
-            stream_uri="/stream.jpg", stream_content_type="image/jpeg",
-            auth=auth
+            stream_uri="/stream.mp4", stream_content_type="video/mp4",
+            auth=auth,
+            stream_quality=args.stream_quality,
         )
     else:
         # Local Viewer
@@ -319,13 +320,7 @@ def iw3_desktop_main(args, init_wxapp=True):
                 frame = screenshot_thread.get_frame()
                 sbs = IW3U.process_image(frame, args, depth_model, side_model)
 
-                if not args.local_viewer:
-                    if args.gpu_jpeg:
-                        server.set_frame_data(to_jpeg_data(sbs, quality=args.stream_quality, tick=tick, gpu_jpeg=args.gpu_jpeg))
-                    else:
-                        server.set_frame_data(lambda: to_jpeg_data(sbs, quality=args.stream_quality, tick=tick, gpu_jpeg=args.gpu_jpeg))
-                else:
-                    server.set_frame_data((sbs, tick))
+                server.set_frame_data((sbs, tick))
 
                 if count % (args.stream_fps * 30) == 0:
                     gc_collect()
