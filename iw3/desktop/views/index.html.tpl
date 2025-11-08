@@ -3,78 +3,54 @@
 <head>
   <title>iw3 desktop streaming</title>
   <script>
-    const FPS = ${fps};
-    const WIDTH = ${frame_width};
-    const HEIGHT = ${frame_height};
     const STREAM_URI = "${stream_uri}";
+    const RELOAD_INTERVAL_MS = 4000;
 
     window.onload = () => {
-        let canvasStream = null;
-        let canvas = document.createElement("canvas");
+        const video = document.getElementById("player-canvas");
         let process_token = null;
-        let stop_update = false;
 
-        canvas.width = WIDTH;
-        canvas.height = HEIGHT;
+        function setVideoSource() {
+            const cacheBuster = `?_ts=${Date.now()}`;
+            const sourceUrl = STREAM_URI + cacheBuster;
+            video.src = sourceUrl;
+            const playPromise = video.play();
+            if (playPromise !== undefined) {
+                playPromise.catch(() => {
+                    /* ignored */
+                });
+            }
+        }
 
-        function setup_interval(){
-            const ctx = canvas.getContext("2d");
-            const img = new Image();
-            let last_timestamp = 0;
+        setVideoSource();
 
-            img.src = STREAM_URI;
-            img.onload = () => {
-                function render(timestamp) {
-                    if (timestamp - last_timestamp >= 1000.0 / FPS) {
-                        last_timestamp = timestamp;
-                        ctx.drawImage(img, 0, 0);
+        video.addEventListener('error', () => {
+            setTimeout(setVideoSource, 1000);
+        });
+
+        setInterval(() => {
+            if (document.hidden) {
+                return;
+            }
+            fetch('/process_token', { method: 'GET' })
+                .then((res) => {
+                    if (!res.ok) {
+                        throw new Error('unavailable');
                     }
-                    requestAnimationFrame(render);
-                }
-                render();
-            };
-            // check server restart
-            setInterval(() => {
-	        if (document.hidden) {
-	            return;
-	        }
-	        fetch('/process_token',
-	              {
-                          method: 'GET',
-	              })
-	            .then((res) => {
-                        if (!res.ok) {
-	                    stop_update = true;
-	                    //console.log("err1", res.status, res.statusText);
-                        }
-                        return res.json();
-	            })
-	            .then((res) => {
-	                //console.log("check token", process_token, res.token);
-	                if (process_token == null) {
-	                    process_token = res.token;
-	                } else if (process_token != res.token) {
-	                    // reload
-	                    process_token = null;
-	                    location.reload();
-	                }
-	            })
-	            .catch((reason) => {
-	                stop_update = true;
-                        //console.log("err2", reason);
-	            });
-            }, 4000);
-        }
-        
-        function setup_video() {
-            const video = document.getElementById("player-canvas");
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(video, 0, 0, WIDTH, HEIGHT);
-            canvasStream = canvas.captureStream(FPS);  // 0-FPS freq
-            video.srcObject = canvasStream;
-        }
-        setup_interval();
-        setup_video();
+                    return res.json();
+                })
+                .then((res) => {
+                    if (process_token == null) {
+                        process_token = res.token;
+                    } else if (process_token !== res.token) {
+                        process_token = null;
+                        setVideoSource();
+                    }
+                })
+                .catch(() => {
+                    setVideoSource();
+                });
+        }, RELOAD_INTERVAL_MS);
     };
   </script>
   <style type="text/css">
@@ -102,7 +78,7 @@
 <body>
   <div class="video-container">
     <video id="player-canvas" class="video" controls controlsList="nodownload"
-	    autoplay loop muted poster="" disablepictureinpicture >
+            autoplay muted poster="" disablepictureinpicture playsinline>
     </video>
   </div>
 </body>
