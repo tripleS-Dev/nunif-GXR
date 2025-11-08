@@ -1,5 +1,4 @@
-""" Mixed-Replace(MJPEG) Streaming Server
-"""
+"""Streaming Server for MJPEG and MP4 delivery."""
 import sys
 import time
 import threading
@@ -11,6 +10,10 @@ import random
 import json
 import base64
 from collections import deque, defaultdict
+from fractions import Fraction
+
+import av
+import numpy as np
 
 
 STATUS_OK = "200 OK"
@@ -21,6 +24,42 @@ class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
     allow_reuse_address = True
     block_on_close = False
 
+
+class _StreamingBuffer:
+    def __init__(self):
+        self._buffer = deque()
+        self._closed = False
+        self._condition = threading.Condition()
+
+    def write(self, data):
+        if not data:
+            return
+        with self._condition:
+            self._buffer.append(bytes(data))
+            self._condition.notify_all()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def read(self, block=True, timeout=None):
+        with self._condition:
+            if not block:
+                if self._buffer:
+                    return self._buffer.popleft()
+                return None
+
+            end_time = None if timeout is None else time.monotonic() + timeout
+            while not self._buffer and not self._closed:
+                remaining = None if end_time is None else max(end_time - time.monotonic(), 0)
+                if end_time is not None and remaining <= 0:
+                    break
+                self._condition.wait(remaining)
+
+            if self._buffer:
+                return self._buffer.popleft()
+            return None
 
 class StreamingServer():
     def __init__(
@@ -168,6 +207,102 @@ class StreamingServer():
             [("Content-Type", "multipart/x-mixed-replace; boundary=frame")])
         return gen()
 
+    def send_video_stream(self, start_response):
+        def gen():
+            generator_id = random.getrandbits(64)
+            data_tick = 0
+            frame_index = 0
+            buffer = _StreamingBuffer()
+            container = None
+            stream = None
+            try:
+                container = av.open(
+                    buffer,
+                    mode='w',
+                    format='mp4',
+                    options={
+                        'movflags': 'frag_keyframe+empty_moov+default_base_moof',
+                    })
+                stream = container.add_stream('libx264', rate=self.fps)
+                stream.width = self.frame_width
+                stream.height = self.frame_height
+                stream.pix_fmt = 'yuv420p'
+                stream.options = {
+                    'preset': 'veryfast',
+                    'tune': 'zerolatency',
+                    'profile': 'baseline',
+                    'level': '3.1',
+                }
+                stream.time_base = Fraction(1, self.fps)
+
+                chunk = buffer.read(block=True, timeout=1.0)
+                while chunk is not None:
+                    yield chunk
+                    chunk = buffer.read(block=False)
+                    if chunk is None:
+                        break
+
+                while True:
+                    try:
+                        data = self.get_frame_data()
+                        if data is not None:
+                            frame, tick = data
+                            if tick > data_tick:
+                                data_tick = tick
+                                with self.op_lock:
+                                    self.fps_counter.append((generator_id, time.perf_counter()))
+                                if not isinstance(frame, np.ndarray):
+                                    frame = np.asarray(frame)
+                                frame = np.ascontiguousarray(frame.astype(np.uint8, copy=False))
+                                video_frame = av.VideoFrame.from_ndarray(frame, format='rgb24')
+                                video_frame = video_frame.reformat(
+                                    width=self.frame_width,
+                                    height=self.frame_height,
+                                    format='yuv420p'
+                                )
+                                video_frame.pts = frame_index
+                                video_frame.time_base = stream.time_base
+                                frame_index += 1
+                                packet = stream.encode(video_frame)
+                                if packet is not None:
+                                    container.mux(packet)
+
+                                chunk = buffer.read(block=False)
+                                while chunk is not None:
+                                    yield chunk
+                                    chunk = buffer.read(block=False)
+                        if self.shutdown_event.is_set():
+                            break
+                        time.sleep(1 / 1000)
+                    except GeneratorExit:
+                        raise
+                    except Exception:
+                        print("StreamingServer", sys.exc_info(), file=sys.stderr)
+                        raise
+            finally:
+                try:
+                    if container is not None and stream is not None:
+                        packet = stream.encode(None)
+                        if packet is not None:
+                            container.mux(packet)
+                    if container is not None:
+                        container.close()
+                finally:
+                    buffer.close()
+                    chunk = buffer.read(block=False)
+                    while chunk is not None:
+                        yield chunk
+                        chunk = buffer.read(block=False)
+
+        start_response(
+            STATUS_OK,
+            [
+                ("Content-Type", "video/mp4"),
+                ("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"),
+                ("Pragma", "no-cache"),
+            ])
+        return gen()
+
     def send_index(self, start_response):
         template = Template(self.index_template)
         page_data = template.substitute(
@@ -207,6 +342,9 @@ class StreamingServer():
         elif uri == "/process_token":
             return self.send_process_token(start_response)
         elif uri == self.stream_uri:
-            return self.send_image_stream(start_response)
+            if self.stream_content_type.startswith("video/"):
+                return self.send_video_stream(start_response)
+            else:
+                return self.send_image_stream(start_response)
         else:
             return self.send_404(start_response)

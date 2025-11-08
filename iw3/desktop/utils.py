@@ -1,5 +1,4 @@
 import threading
-import io
 import sys
 import math
 from os import path
@@ -8,9 +7,7 @@ import socket
 import ipaddress
 from collections import deque
 import wx  # for mouse pointer
-from packaging.version import Version
 import torch
-from torchvision.io import encode_jpeg
 from nunif.device import create_device
 from nunif.models import compile_model
 from nunif.models.data_parallel import DeviceSwitchInference
@@ -31,8 +28,6 @@ except ImportError:
     LocalViewer = None
 
 
-TORCH_VERSION = Version(torch.__version__)
-ENABLE_GPU_JPEG = (TORCH_VERSION.major, TORCH_VERSION.minor) >= (2, 7)
 TORCH_NUM_THREADS = torch.get_num_threads()
 
 
@@ -100,27 +95,10 @@ def fps_sleep(start_time, fps, resolution=2e-4):
         time.sleep(resolution)
 
 
-def to_jpeg_data(frame, quality, tick, gpu_jpeg=True):
-    bio = io.BytesIO()
-    if ENABLE_GPU_JPEG and gpu_jpeg and frame.device.type == "cuda":
-        jpeg_data = encode_jpeg(to_uint8(frame), quality=quality).cpu()
-    else:
-        jpeg_data = encode_jpeg(to_uint8(frame).cpu(), quality=quality)
-    bio.write(jpeg_data.numpy())
-    jpeg_data = bio.getbuffer().tobytes()
-    # debug_jpeg_data(frame, jpeg_data)
-    return (jpeg_data, tick)
-
-
-def debug_jpeg_data(frame, jpeg_data):
-    from torchvision.io import decode_jpeg
-    jpeg_data = torch.tensor(list(jpeg_data), dtype=torch.uint8)
-    try:
-        decodec_frame = decode_jpeg(jpeg_data).cpu() / 255.0
-        diff = (frame.cpu() - decodec_frame).abs().mean()
-        print(diff)
-    except RuntimeError as e:
-        print(e)
+def to_video_frame_data(frame, tick):
+    frame_uint8 = to_uint8(frame.clamp(0.0, 1.0))
+    frame_uint8 = frame_uint8.permute(1, 2, 0).contiguous().cpu().numpy()
+    return (frame_uint8, tick)
 
 
 def create_parser():
@@ -135,7 +113,7 @@ def create_parser():
     parser.add_argument("--password", type=str, help="HTTP Basic Authentication password")
     parser.add_argument("--stream-fps", type=int, default=30, help="Streaming FPS")
     parser.add_argument("--stream-height", type=int, default=1080, help="Streaming screen resolution")
-    parser.add_argument("--stream-quality", type=int, default=90, help="Streaming JPEG quality")
+    parser.add_argument("--stream-quality", type=int, default=90, help="(Deprecated) Streaming JPEG quality")
     parser.add_argument("--full-sbs", action="store_true", help="Use Full SBS for Pico4")
     parser.add_argument("--screenshot", type=str, default="pil", choices=["pil", "pil_mp", "wc_mp"],
                         help="Screenshot method")
@@ -276,7 +254,7 @@ def iw3_desktop_main(args, init_wxapp=True):
             frame_height=output_frame_height,
             fps=args.stream_fps,
             index_template=index_template,
-            stream_uri="/stream.jpg", stream_content_type="image/jpeg",
+            stream_uri="/stream.mp4", stream_content_type="video/mp4",
             auth=auth
         )
     else:
@@ -320,10 +298,7 @@ def iw3_desktop_main(args, init_wxapp=True):
                 sbs = IW3U.process_image(frame, args, depth_model, side_model)
 
                 if not args.local_viewer:
-                    if args.gpu_jpeg:
-                        server.set_frame_data(to_jpeg_data(sbs, quality=args.stream_quality, tick=tick, gpu_jpeg=args.gpu_jpeg))
-                    else:
-                        server.set_frame_data(lambda: to_jpeg_data(sbs, quality=args.stream_quality, tick=tick, gpu_jpeg=args.gpu_jpeg))
+                    server.set_frame_data(lambda: to_video_frame_data(sbs, tick=tick))
                 else:
                     server.set_frame_data((sbs, tick))
 
