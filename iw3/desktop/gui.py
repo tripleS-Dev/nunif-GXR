@@ -41,7 +41,7 @@ from .utils import (
     create_parser, set_state_args,
     get_monitor_size_list,
     enum_window_names,
-    IW3U, ENABLE_GPU_JPEG,
+    IW3U,
 )
 
 
@@ -309,17 +309,16 @@ class MainFrame(wx.Frame):
                                                   name="cbo_stream_height")
         self.cbo_stream_height.SetSelection(0)
 
-        self.lbl_stream_quality = wx.StaticText(self.grp_network, label=T("MJPEG Quality"))
+        self.lbl_stream_quality = wx.StaticText(self.grp_network, label=T("Streaming Quality"))
         self.cbo_stream_quality = EditableComboBox(self.grp_network, choices=["100", "95", "90", "85", "80"],
                                                    name="cbo_stream_quality")
         self.cbo_stream_quality.SetSelection(2)
         self.chk_pad_16_9 = wx.CheckBox(self.grp_network, label=T("Padding") + " 16:9", name="chk_pad_16_9")
         self.chk_pad_16_9.SetValue(False)
 
-        self.chk_gpu_jpeg = wx.CheckBox(self.grp_network, label=T("GPU JPEG"), name="chk_gpu_jpeg")
+        self.chk_gpu_jpeg = wx.CheckBox(self.grp_network, label=T("GPU JPEG (deprecated)"), name="chk_gpu_jpeg")
         self.chk_gpu_jpeg.SetValue(False)
-        if not ENABLE_GPU_JPEG:
-            self.chk_gpu_jpeg.Disable()
+        self.chk_gpu_jpeg.Disable()
         self.sep_network1 = wx.StaticLine(self.grp_network, style=wx.LI_HORIZONTAL)
 
         self.chk_auth = wx.CheckBox(self.grp_network, label=T("Basic Authentication"), name="chk_auth")
