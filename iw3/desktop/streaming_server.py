@@ -1,4 +1,11 @@
-""" Mixed-Replace(MJPEG) Streaming Server
+"""HTTP streaming server for iw3 Web Streaming.
+
+The original implementation exposed a multipart MJPEG stream so that the
+frontend could update a ``<canvas>`` with sequential JPEG snapshots.  In order
+to make browsers present native video playback controls (seek bar, remaining
+time, etc.) we now expose an MP4 container stream that is produced on the fly
+with PyAV/FFmpeg.  The stream is provided as fragmented MP4 (``movflags``
+``empty_moov``) so that it can be consumed while it is being produced.
 """
 import sys
 import time
@@ -11,6 +18,11 @@ import random
 import json
 import base64
 from collections import deque, defaultdict
+from fractions import Fraction
+
+import numpy as np
+import av
+import torch
 
 
 STATUS_OK = "200 OK"
@@ -22,12 +34,36 @@ class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
     block_on_close = False
 
 
+class _StreamingBuffer(io.BytesIO):
+    """In-memory buffer that lets PyAV append data incrementally."""
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+
+    def write(self, b):  # noqa: D401 - signature defined by io.RawIOBase
+        with self._lock:
+            self.seek(0, io.SEEK_END)
+            super().write(b)
+        return len(b)
+
+    def read_new(self):
+        """Return newly written bytes and clear the internal storage."""
+
+        with self._lock:
+            self.seek(0)
+            data = super().read()
+            self.truncate(0)
+            self.seek(0)
+        return data
+
+
 class StreamingServer():
     def __init__(
             self, port, lock,
             frame_width, frame_height, fps,
             index_template,
-            stream_uri="/stream.jpg", stream_content_type="image/jpeg",
+            stream_uri="/stream.mp4", stream_content_type="video/mp4",
             auth=None, host=""):
         self.port = port
         self.host = host
@@ -40,6 +76,7 @@ class StreamingServer():
         self.index_template = index_template
         self.stream_uri = stream_uri
         self.stream_content_type = stream_content_type
+        self.fake_duration = 3600  # seconds, used to show a remaining time bar
 
         self.frame_data = None
         self.frame_data_raw = None
@@ -124,48 +161,136 @@ class StreamingServer():
         else:
             return 0
 
-    def send_image_stream(self, start_response):
+    def _tensor_to_ndarray(self, frame):
+        if isinstance(frame, torch.Tensor):
+            if frame.device.type != "cpu":
+                frame = frame.detach().to("cpu")
+            else:
+                frame = frame.detach()
+            frame = frame.clamp(0.0, 1.0)
+            if frame.ndim == 3:
+                frame = frame.permute(1, 2, 0)
+            elif frame.ndim == 4:
+                frame = frame.squeeze(0).permute(1, 2, 0)
+            frame = (frame * 255.0).round().to(torch.uint8)
+            return frame.numpy()
+        if isinstance(frame, np.ndarray):
+            if frame.dtype != np.uint8:
+                arr = np.clip(frame, 0.0, 1.0)
+                arr = (arr * 255.0).round().astype(np.uint8)
+                return arr
+            return frame
+        raise TypeError(f"Unsupported frame type: {type(frame)}")
+
+    def _create_video_stream(self, container, width, height):
+        codec_candidates = ["libx264", "h264", "mpeg4"]
+        last_error = None
+        for codec in codec_candidates:
+            try:
+                stream = container.add_stream(codec, rate=self.fps)
+                stream.width = width
+                stream.height = height
+                if self.fps:
+                    stream.time_base = Fraction(1, int(self.fps))
+                if codec in ("libx264", "h264"):
+                    stream.pix_fmt = "yuv420p"
+                    stream.options = {
+                        "preset": "veryfast",
+                        "tune": "zerolatency",
+                        "crf": "23",
+                    }
+                else:
+                    stream.pix_fmt = "yuv420p"
+                return stream
+            except av.AVError as exc:  # pragma: no cover - codec availability differs per environment
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Unable to initialize video encoder")
+
+    def send_video_stream(self, start_response):
         def gen():
             generator_id = random.getrandbits(64)
             data_tick = 0
-            frame = None
-            send_at = time.perf_counter()
-            bio = io.BytesIO()
-            bio.write(b'--frame\r\n' + f"Content-Type: {self.stream_content_type}".encode() + b'\r\n\r\n')
-            pos = bio.tell()
-            while True:
-                try:
-                    data = self.get_frame_data()
-                    if data is not None:
-                        frame, tick = data
-                        if tick > data_tick:
-                            data_tick = tick
-                            with self.op_lock:
-                                self.fps_counter.append((generator_id, time.perf_counter()))
-                            bio.seek(pos, io.SEEK_SET)
-                            bio.truncate(pos)
-                            bio.write(frame)
-                            yield bio.getbuffer().tobytes()
-                    if self.shutdown_event.is_set():
-                        break
-                    if False:  # True if needed
-                        now = time.perf_counter()
-                        if now - send_at < self.delay:
-                            time.sleep(self.delay - (now - send_at))
-                        send_at = now
-                    else:
-                        # busy waiting
-                        time.sleep(1 / 1000)
-                except GeneratorExit:
-                    raise
-                except:  # noqa
-                    print("StreamingServer", sys.exc_info(), file=sys.stderr)
-                    raise
+            buffer = _StreamingBuffer()
+            container = None
+            stream = None
+            pts = 0
+            time_base = Fraction(1, int(self.fps)) if self.fps else Fraction(1, 30)
+
+            try:
+                while True:
+                    try:
+                        data = self.get_frame_data()
+                        if data is not None:
+                            frame, tick = data
+                            if tick <= data_tick:
+                                # already handled
+                                pass
+                            else:
+                                data_tick = tick
+                                with self.op_lock:
+                                    self.fps_counter.append((generator_id, time.perf_counter()))
+
+                                ndarray = self._tensor_to_ndarray(frame)
+                                if container is None:
+                                    container = av.open(
+                                        buffer,
+                                        mode="w",
+                                        format="mp4",
+                                        options={
+                                            "movflags": "frag_keyframe+empty_moov+default_base_moof",
+                                            "brand": "iso6"
+                                        }
+                                    )
+                                    stream = self._create_video_stream(container, ndarray.shape[1], ndarray.shape[0])
+                                    container.write_header()
+                                    header = buffer.read_new()
+                                    if header:
+                                        yield header
+
+                                video_frame = av.VideoFrame.from_ndarray(ndarray, format="rgb24")
+                                video_frame.pts = pts
+                                video_frame.time_base = time_base
+                                pts += 1
+
+                                for packet in stream.encode(video_frame):
+                                    packet.time_base = stream.time_base
+                                    container.mux(packet)
+
+                                chunk = buffer.read_new()
+                                if chunk:
+                                    yield chunk
+
+                        if self.shutdown_event.is_set():
+                            break
+
+                        if data is None:
+                            time.sleep(1 / 1000)
+                    except GeneratorExit:
+                        raise
+                    except Exception:  # noqa: broad-except
+                        print("StreamingServer", sys.exc_info(), file=sys.stderr)
+                        raise
+            finally:
+                if container is not None:
+                    for packet in stream.encode(None):
+                        container.mux(packet)
+                    container.close()
+                    tail = buffer.read_new()
+                    if tail:
+                        yield tail
+
             yield b""
 
-        start_response(
-            STATUS_OK,
-            [("Content-Type", "multipart/x-mixed-replace; boundary=frame")])
+        headers = [
+            ("Content-Type", self.stream_content_type),
+            ("Cache-Control", "no-cache, no-store, must-revalidate"),
+            ("Pragma", "no-cache"),
+            ("Expires", "0"),
+            ("X-Content-Duration", str(self.fake_duration))
+        ]
+        start_response(STATUS_OK, headers)
         return gen()
 
     def send_index(self, start_response):
@@ -207,6 +332,6 @@ class StreamingServer():
         elif uri == "/process_token":
             return self.send_process_token(start_response)
         elif uri == self.stream_uri:
-            return self.send_image_stream(start_response)
+            return self.send_video_stream(start_response)
         else:
             return self.send_404(start_response)
